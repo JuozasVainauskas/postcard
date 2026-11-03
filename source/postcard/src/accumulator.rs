@@ -65,6 +65,8 @@ use serde::Deserialize;
 pub struct CobsAccumulator<const N: usize> {
     buf: [u8; N],
     idx: usize,
+    /// Dropping the rest of a message that didn't fit, up to its terminating zero
+    discarding: bool,
 }
 
 /// The result of feeding the accumulator.
@@ -73,7 +75,8 @@ pub enum FeedResult<'a, T> {
     /// Consumed all data, still pending.
     Consumed,
 
-    /// Buffer was filled. Contains remaining section of input, if any.
+    /// A message didn't fit in the buffer and is dropped up to its terminating zero.
+    /// Contains the input after that zero, if it was in this chunk.
     OverFull(&'a [u8]),
 
     /// Reached end of chunk, but deserialization failed. Contains remaining section of input, if any.
@@ -101,6 +104,7 @@ impl<const N: usize> CobsAccumulator<N> {
         CobsAccumulator {
             buf: [0; N],
             idx: 0,
+            discarding: false,
         }
     }
 
@@ -124,6 +128,19 @@ impl<const N: usize> CobsAccumulator<N> {
     where
         T: Deserialize<'de>,
     {
+        // The rest of an oversized message is not the start of a new one
+        let input = if self.discarding {
+            match input.iter().position(|&i| i == 0) {
+                Some(n) => {
+                    self.discarding = false;
+                    &input[n + 1..]
+                }
+                None => return FeedResult::Consumed,
+            }
+        } else {
+            input
+        };
+
         if input.is_empty() {
             return FeedResult::Consumed;
         }
@@ -157,10 +174,10 @@ impl<const N: usize> CobsAccumulator<N> {
         } else {
             // Does it fit?
             if (self.idx + input.len()) > N {
-                // nope
-                let new_start = N - self.idx;
+                // nope, and everything up to the next zero still belongs to this message
                 self.idx = 0;
-                FeedResult::OverFull(&input[new_start..])
+                self.discarding = true;
+                FeedResult::OverFull(&[])
             } else {
                 // yup!
                 self.extend_unchecked(input);
@@ -184,6 +201,57 @@ impl<const N: usize> CobsAccumulator<N> {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[derive(serde::Serialize, Deserialize, Debug, PartialEq, Eq)]
+    struct Short {
+        a: u32,
+        b: u8,
+    }
+
+    /// What the accumulator reports for `stream` fed in `chunk`-byte pieces
+    fn feed_in_chunks(stream: &[u8], chunk: usize) -> std::vec::Vec<Option<Short>> {
+        let mut cobs_buf: CobsAccumulator<64> = CobsAccumulator::new();
+        let mut events = std::vec::Vec::new();
+        for piece in stream.chunks(chunk) {
+            let mut window = piece;
+            while !window.is_empty() {
+                window = match cobs_buf.feed::<Short>(window) {
+                    FeedResult::Consumed => &[],
+                    FeedResult::OverFull(rest) | FeedResult::DeserError(rest) => {
+                        events.push(None);
+                        rest
+                    }
+                    FeedResult::Success { data, remaining } => {
+                        events.push(Some(data));
+                        remaining
+                    }
+                };
+            }
+        }
+        events
+    }
+
+    #[test]
+    fn overfull_drops_the_whole_oversized_message() {
+        let mut first = [0u8; 32];
+        let mut second = [0u8; 32];
+        let looks_valid = crate::to_slice_cobs(&Short { a: 7, b: 9 }, &mut first).unwrap();
+        let genuine = crate::to_slice_cobs(&Short { a: 1, b: 2 }, &mut second).unwrap();
+
+        // One oversized message whose tail happens to look like a whole `Short`, then a real one
+        let mut stream = std::vec![0x55u8; 64];
+        stream.extend_from_slice(looks_valid);
+        stream.extend_from_slice(genuine);
+
+        // Byte by byte like a UART, in odd chunks, and all at once
+        for chunk in [1, 5, 13, stream.len()] {
+            assert_eq!(
+                feed_in_chunks(&stream, chunk),
+                [None, Some(Short { a: 1, b: 2 })],
+                "chunk {chunk}"
+            );
+        }
+    }
 
     #[test]
     fn loop_test() {
