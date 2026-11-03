@@ -124,6 +124,37 @@ impl<const N: usize> CobsAccumulator<N> {
     where
         T: Deserialize<'de>,
     {
+        self.feed_ref_with(input, false)
+    }
+
+    /// Like [`feed`](Self::feed), but a message with bytes left over after `T` is a
+    /// [`FeedResult::DeserError`].
+    ///
+    /// `feed` deserializes `T` from the front of each message and ignores the rest, so a message
+    /// written with a longer or different type (for example, from a peer built against a newer
+    /// version of a shared struct) can still decode as a valid but wrong `T`. Use this when both
+    /// sides must agree on the exact type.
+    #[inline]
+    pub fn feed_exact<'a, T>(&mut self, input: &'a [u8]) -> FeedResult<'a, T>
+    where
+        T: for<'de> Deserialize<'de>,
+    {
+        self.feed_ref_exact(input)
+    }
+
+    /// Like [`feed_ref`](Self::feed_ref), but a message with bytes left over after `T` is a
+    /// [`FeedResult::DeserError`], see [`feed_exact`](Self::feed_exact).
+    pub fn feed_ref_exact<'de, 'a, T>(&'de mut self, input: &'a [u8]) -> FeedResult<'a, T>
+    where
+        T: Deserialize<'de>,
+    {
+        self.feed_ref_with(input, true)
+    }
+
+    fn feed_ref_with<'de, 'a, T>(&'de mut self, input: &'a [u8], exact: bool) -> FeedResult<'a, T>
+    where
+        T: Deserialize<'de>,
+    {
         if input.is_empty() {
             return FeedResult::Consumed;
         }
@@ -141,7 +172,7 @@ impl<const N: usize> CobsAccumulator<N> {
                 // Aw yiss - add to array
                 self.extend_unchecked(take);
 
-                let retval = match crate::from_bytes_cobs::<T>(&mut self.buf[..self.idx]) {
+                let retval = match deserialize_message::<T>(&mut self.buf[..self.idx], exact) {
                     Ok(t) => FeedResult::Success {
                         data: t,
                         remaining: release,
@@ -181,9 +212,107 @@ impl<const N: usize> CobsAccumulator<N> {
     }
 }
 
+/// Deserializes one COBS message, rejecting bytes left over after `T` when `exact`
+fn deserialize_message<'de, T>(message: &'de mut [u8], exact: bool) -> crate::Result<T>
+where
+    T: Deserialize<'de>,
+{
+    if !exact {
+        return crate::from_bytes_cobs(message);
+    }
+    let len = cobs::decode_in_place(message).map_err(|_| crate::Error::DeserializeBadEncoding)?;
+    match crate::take_from_bytes(&message[..len])? {
+        (value, []) => Ok(value),
+        _ => Err(crate::Error::DeserializeBadEncoding),
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[derive(serde::Serialize, Deserialize, Debug, PartialEq, Eq)]
+    struct Short {
+        a: u32,
+        b: u8,
+    }
+
+    #[derive(serde::Serialize)]
+    struct Long {
+        a: u32,
+        b: u8,
+        c: u16,
+    }
+
+    #[test]
+    fn feed_exact_accepts_an_exact_message() {
+        let mut raw_buf = [0u8; 64];
+        let ser = crate::to_slice_cobs(&Short { a: 10, b: 20 }, &mut raw_buf).unwrap();
+        let mut cobs_buf: CobsAccumulator<64> = CobsAccumulator::new();
+
+        match cobs_buf.feed_exact::<Short>(ser) {
+            FeedResult::Success { data, remaining } => {
+                assert_eq!(Short { a: 10, b: 20 }, data);
+                assert!(remaining.is_empty());
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn feed_exact_rejects_bytes_left_over_after_the_type() {
+        let mut raw_buf = [0u8; 64];
+        let ser = crate::to_slice_cobs(
+            &Long {
+                a: 10,
+                b: 20,
+                c: 30,
+            },
+            &mut raw_buf,
+        )
+        .unwrap();
+
+        let mut cobs_buf: CobsAccumulator<64> = CobsAccumulator::new();
+        assert!(matches!(
+            cobs_buf.feed_exact::<Short>(ser),
+            FeedResult::DeserError(remaining) if remaining.is_empty()
+        ));
+
+        // `feed` is unchanged: it still reads `Short` from the front and ignores the rest
+        let mut cobs_buf: CobsAccumulator<64> = CobsAccumulator::new();
+        assert!(matches!(
+            cobs_buf.feed::<Short>(ser),
+            FeedResult::Success {
+                data: Short { a: 10, b: 20 },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn feed_exact_hands_back_the_next_message() {
+        let mut first = [0u8; 32];
+        let mut second = [0u8; 32];
+        let first = crate::to_slice_cobs(&Long { a: 1, b: 2, c: 3 }, &mut first).unwrap();
+        let second = crate::to_slice_cobs(&Short { a: 4, b: 5 }, &mut second).unwrap();
+        let mut both = [0u8; 64];
+        both[..first.len()].copy_from_slice(first);
+        both[first.len()..first.len() + second.len()].copy_from_slice(second);
+        let both = &both[..first.len() + second.len()];
+
+        let mut cobs_buf: CobsAccumulator<64> = CobsAccumulator::new();
+        let remaining = match cobs_buf.feed_exact::<Short>(both) {
+            FeedResult::DeserError(remaining) => remaining,
+            _ => panic!(),
+        };
+        assert!(matches!(
+            cobs_buf.feed_exact::<Short>(remaining),
+            FeedResult::Success {
+                data: Short { a: 4, b: 5 },
+                ..
+            }
+        ));
+    }
 
     #[test]
     fn loop_test() {
